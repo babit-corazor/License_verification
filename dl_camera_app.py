@@ -25,7 +25,7 @@ from pymongo import MongoClient
 # Config
 # =========================
 YOLO_WEIGHTS = "runs/detect/runs/detect/multistate_dl2/weights/best.pt"
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://corazortechnology:A0Qfk2PbjOMKN32Z@cluster0.drxzj5r.mongodb.net/")
+MONGO_URI = os.environ.get("MONGO_URI", "")
 
 client = MongoClient(MONGO_URI)
 collection = client["licenseDB"]["licenses"]
