@@ -1,15 +1,14 @@
 """
-dl_camera_app.py — Multi-State Driving License Scanner (Enhanced Accuracy)
+dl_camera_app.py — Multi-State Driving License Scanner (Simplified + Enhanced)
 
 Improvements:
-  1. Aggressive preprocessing for small text (2x upscale, stronger sharpening)
-  2. Multi-OCR fusion (PaddleOCR + EasyOCR + Tesseract)
-  3. Smart post-processing (pattern validation, OCR error correction)
+  1. Aggressive preprocessing (2x upscale, stronger enhancement)
+  2. PaddleOCR only (removed multi-OCR to avoid crashes)
+  3. Smart validation and error correction
 
 Workflow:
   FRONT (3 retries): name, dl_no, issue_date
   BACK (3 retries): expiry_date
-  Save to MongoDB
 """
 
 import os
@@ -22,8 +21,6 @@ import torch
 from datetime import datetime
 from ultralytics import YOLO
 from paddleocr import PaddleOCR
-import easyocr
-import pytesseract
 from pymongo import MongoClient
 
 # =========================
@@ -36,8 +33,7 @@ client = MongoClient(MONGO_URI)
 collection = client["licenseDB"]["licenses"]
 
 yolo_model = None
-paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en")
-easy_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+ocr = PaddleOCR(use_angle_cls=True, lang="en")
 MAX_RETRIES = 3
 
 YOLO_CLASSES = {0: "name", 1: "dl_no", 2: "dob"}
@@ -45,197 +41,134 @@ YOLO_CLASSES = {0: "name", 1: "dl_no", 2: "dob"}
 # =========================
 # Enhanced Preprocessing
 # =========================
-def aggressive_preprocess(crop):
-    """Enhanced preprocessing for small/faded text."""
+def enhance_crop(crop):
+    """Aggressive enhancement for small text."""
     h, w = crop.shape[:2]
 
-    # 1. Aggressive upscaling (2x minimum)
+    # 2x upscaling
     if w < 600:
         scale = 600 / w
         crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-    # 2. Heavy denoising
-    crop = cv2.fastNlMeansDenoisingColored(crop, None, h=15, hColor=15,
-                                            templateWindowSize=7, searchWindowSize=21)
+    # Strong denoising
+    crop = cv2.fastNlMeansDenoisingColored(crop, None, 15, 15, 7, 21)
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-    # 3. CLAHE with stronger clip limit
+    # Aggressive CLAHE
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
     eq = clahe.apply(gray)
 
-    # 4. Aggressive unsharp masking
+    # Strong unsharp masking
     blur = cv2.GaussianBlur(eq, (0, 0), 2.5)
     sharp = cv2.addWeighted(eq, 2.0, blur, -1.0, 0)
 
-    # 5. Adaptive thresholding for faded text
-    _, binary = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Return both grayscale and binary versions
-    return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR), cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
 
 
-def preprocess_full_image(frame):
-    """Two-pass preprocessing with aggressive enhancement."""
+def enhance_full_image(frame):
+    """Enhanced full-image preprocessing."""
     h, w = frame.shape[:2]
 
-    # Upscale 2x for small text
+    # 2x upscaling
     up = cv2.resize(frame, None, fx=2000/w, fy=2000/w, interpolation=cv2.INTER_CUBIC)
     up = cv2.fastNlMeansDenoisingColored(up, None, 15, 15, 7, 21)
 
-    # Pass A — enhanced grayscale
+    # Enhanced grayscale
     gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
     eq = clahe.apply(gray)
     blur = cv2.GaussianBlur(eq, (0, 0), 3)
-    passA = cv2.cvtColor(cv2.addWeighted(eq, 2.0, blur, -1.0, 0), cv2.COLOR_GRAY2BGR)
+    enhanced = cv2.addWeighted(eq, 2.0, blur, -1.0, 0)
 
-    # Pass B — red channel isolation
-    b, g, r = cv2.split(up)
-    red_only = cv2.subtract(r, cv2.addWeighted(g, 0.5, b, 0.5, 0))
-    clahe2 = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(4, 4))
-    red_eq = clahe2.apply(red_only)
-    blur2 = cv2.GaussianBlur(red_eq, (0, 0), 2.5)
-    passB = cv2.cvtColor(cv2.addWeighted(red_eq, 2.2, blur2, -1.2, 0), cv2.COLOR_GRAY2BGR)
-
-    return passA, passB
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
 
 # =========================
-# Multi-OCR Fusion
+# OCR
 # =========================
-def run_paddle_ocr(img):
-    """Run PaddleOCR and return text + confidence."""
-    result = paddle_ocr.ocr(img, cls=True)
-    texts = []
+def run_ocr(img):
+    """Run PaddleOCR and return text."""
+    try:
+        result = ocr.ocr(img, cls=True)
+        texts = []
+        for line in result:
+            if not line:
+                continue
+            for word_info in line:
+                text = word_info[1][0].strip()
+                if text:
+                    texts.append(text)
+        return " ".join(texts) if texts else None
+    except Exception as e:
+        print(f"    OCR error: {e}")
+        return None
+
+
+def extract_all_text(frame):
+    """Run OCR on enhanced full image."""
+    enhanced = enhance_full_image(frame)
+    result = ocr.ocr(enhanced, cls=True)
+
+    all_texts = []
     for line in result:
         if not line:
             continue
         for word_info in line:
             text = word_info[1][0].strip()
-            conf = word_info[1][1]
             if text:
-                texts.append((text, conf))
-    if not texts:
-        return None, 0.0
-    # Return joined text with average confidence
-    full_text = " ".join([t[0] for t in texts])
-    avg_conf = sum([t[1] for t in texts]) / len(texts)
-    return full_text, avg_conf
+                all_texts.append(text)
 
-
-def run_easy_ocr(img):
-    """Run EasyOCR and return text + confidence."""
-    result = easy_reader.readtext(img)
-    if not result:
-        return None, 0.0
-    texts = [(item[1], item[2]) for item in result]
-    full_text = " ".join([t[0] for t in texts])
-    avg_conf = sum([t[1] for t in texts]) / len(texts)
-    return full_text, avg_conf
-
-
-def run_tesseract_ocr(img):
-    """Run Tesseract OCR and return text."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    text = pytesseract.image_to_string(gray, config='--psm 6').strip()
-    # Tesseract doesn't return confidence easily, assume 0.7 if text found
-    return text if text else None, 0.7 if text else 0.0
-
-
-def multi_ocr_fusion(crop):
-    """Run all 3 OCR engines and pick best result."""
-    gray_crop, binary_crop = aggressive_preprocess(crop)
-
-    results = []
-
-    # Run all OCRs on both versions
-    for version_name, version_img in [("gray", gray_crop), ("binary", binary_crop)]:
-        paddle_text, paddle_conf = run_paddle_ocr(version_img)
-        easy_text, easy_conf = run_easy_ocr(version_img)
-        tess_text, tess_conf = run_tesseract_ocr(version_img)
-
-        if paddle_text:
-            results.append(("Paddle", paddle_text, paddle_conf))
-        if easy_text:
-            results.append(("Easy", easy_text, easy_conf))
-        if tess_text:
-            results.append(("Tess", tess_text, tess_conf))
-
-    if not results:
-        return None
-
-    # Pick highest confidence result
-    results.sort(key=lambda x: x[2], reverse=True)
-    best_engine, best_text, best_conf = results[0]
-
-    print(f"    OCR fusion: {best_engine} (conf={best_conf:.2f}) -> '{best_text}'")
-    return best_text
+    return all_texts
 
 
 # =========================
-# Smart Post-Processing
+# Validation & Post-Processing
 # =========================
 def fix_ocr_errors(text):
-    """Fix common OCR character substitutions."""
+    """Fix common OCR mistakes."""
     if not text:
         return text
-
-    # Common OCR errors in alphanumeric strings
-    fixes = {
-        'O': '0',  # Letter O -> Zero (in digit context)
-        'o': '0',
-        'I': '1',  # Letter I -> One
-        'l': '1',  # Lowercase L -> One
-        'S': '5',  # Sometimes S -> 5 in numbers
-        'Z': '2',  # Sometimes Z -> 2
-    }
 
     result = list(text)
     for i, ch in enumerate(result):
         prev_digit = i > 0 and result[i-1].isdigit()
         next_digit = i < len(result)-1 and result[i+1].isdigit()
 
-        if ch in fixes and (prev_digit or next_digit):
-            result[i] = fixes[ch]
+        if ch in ('O', 'o') and (prev_digit or next_digit):
+            result[i] = '0'
+        elif ch in ('I', 'l') and (prev_digit or next_digit):
+            result[i] = '1'
+        elif ch == 'S' and (prev_digit or next_digit):
+            result[i] = '5'
 
     return ''.join(result)
 
 
 def validate_dl_number(text):
-    """Validate and fix DL number format."""
+    """Validate DL number: XX## #### #######."""
     if not text:
         return None
 
-    # Remove spaces and fix common errors
     cleaned = fix_ocr_errors(text.replace(" ", "").replace("-", "").upper())
 
-    # Indian DL format: 2 letters + 2-4 digits (RTO) + 4 digits (year) + 7 digits (serial)
-    # Total: 15-17 chars, typically 16
-    # Example: TS10820200000403 (16 chars)
-
-    # Pattern: XX## #### #######
+    # 2 letters + 13-17 digits
     if re.match(r'^[A-Z]{2}\d{13,17}$', cleaned):
         return cleaned
 
-    # Try to extract if embedded in longer string
+    # Try to extract if embedded
     match = re.search(r'([A-Z]{2}\d{13,17})', cleaned)
-    if match:
-        return match.group(1)
-
-    return None
+    return match.group(1) if match else None
 
 
 def validate_name(text):
-    """Validate and clean name."""
+    """Validate name: 2+ words, alphabetic only."""
     if not text:
         return None
 
-    # Remove non-alphabetic except spaces and hyphens
     cleaned = re.sub(r'[^A-Za-z\s\-]', '', text).strip()
-
-    # Must be at least 2 words, 5 chars total
     words = cleaned.split()
+
     if len(words) >= 2 and len(cleaned) >= 5:
         return cleaned.upper()
 
@@ -243,31 +176,33 @@ def validate_name(text):
 
 
 def validate_date(text):
-    """Validate and parse date."""
+    """Extract and validate dates."""
     if not text:
         return None
 
-    # Extract date patterns
+    # Try to find date patterns
     patterns = [
-        r'(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})',  # DD/MM/YYYY
-        r'(\d{8})',                           # DDMMYYYY
-        r'(\d{4})/(\d{4})',                   # DDMM/YYYY (garbled)
+        r'(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})',
+        r'(\d{8})',
+        r'(\d{4})/(\d{4})',  # garbled DDMM/YYYY
     ]
 
     for pat in patterns:
         match = re.search(pat, text)
         if match:
-            if len(match.groups()) == 2:  # DDMM/YYYY format
+            if len(match.groups()) == 2:
                 date_str = match.group(1) + match.group(2)
             else:
                 date_str = match.group(1)
 
-            # Try parsing
             for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d%m%Y"]:
                 try:
-                    dt = datetime.strptime(date_str.replace("/", "").replace("-", "").replace(".", "")
-                                          if len(date_str) == 8 else date_str.replace("-", "/").replace(".", "/"),
-                                          fmt if "/" in fmt or "-" in fmt or "." in fmt else "%d%m%Y")
+                    clean_str = date_str.replace("/", "").replace("-", "").replace(".", "")
+                    if len(clean_str) == 8:
+                        dt = datetime.strptime(clean_str, "%d%m%Y")
+                    else:
+                        dt = datetime.strptime(date_str.replace("-", "/").replace(".", "/"), fmt)
+
                     if 1950 <= dt.year <= 2060:
                         return dt.strftime("%d-%m-%Y")
                 except:
@@ -277,35 +212,13 @@ def validate_date(text):
 
 
 # =========================
-# OCR + Validation Pipeline
+# Date Finding
 # =========================
-def extract_full_image_text(frame):
-    """Run multi-OCR on full image."""
-    passA, passB = preprocess_full_image(frame)
-    all_texts = []
-    seen = set()
-
-    for img in [passA, passB]:
-        # Run all 3 OCRs
-        paddle_text, _ = run_paddle_ocr(img)
-        easy_text, _ = run_easy_ocr(img)
-        tess_text, _ = run_tesseract_ocr(img)
-
-        for text in [paddle_text, easy_text, tess_text]:
-            if not text:
-                continue
-            key = re.sub(r"\s+", "", text.upper())
-            if key not in seen:
-                seen.add(key)
-                all_texts.append(text)
-
-    return all_texts
-
-
 def find_issue_date(texts):
-    """Find issue date with validation."""
+    """Find issue date."""
     today = datetime.today()
 
+    # Look for "issued" label
     for text in texts:
         if re.search(r"(?:issued|issue|on)", text, re.IGNORECASE):
             validated = validate_date(text)
@@ -326,7 +239,8 @@ def find_issue_date(texts):
 
 
 def find_expiry_date(texts):
-    """Find expiry date with validation."""
+    """Find expiry date."""
+    # Look for "validity" label
     for text in texts:
         if re.search(r"(?:validity|valid|expiry)", text, re.IGNORECASE):
             validated = validate_date(text)
@@ -368,13 +282,14 @@ def load_yolo():
     print(f"  ✅ YOLO loaded (device={device})")
 
 
-def detect_yolo_fields(img_bgr):
-    """YOLO detection + multi-OCR + validation."""
+def detect_fields(img_bgr):
+    """YOLO + OCR + validation."""
     h, w = img_bgr.shape[:2]
     if w < 1000:
         scale = 1000 / w
         img_bgr = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         h, w = img_bgr.shape[:2]
+
 
     device = 0 if torch.cuda.is_available() else "cpu"
     results = yolo_model.predict(img_bgr, conf=0.25, device=device, verbose=False)
@@ -384,9 +299,7 @@ def detect_yolo_fields(img_bgr):
     for box in boxes:
         cls_id = int(box.cls[0])
         field = YOLO_CLASSES.get(cls_id)
-        if field == "dob":
-            continue
-        if not field:
+        if field == "dob" or not field:
             continue
 
         conf = float(box.conf[0])
@@ -398,8 +311,8 @@ def detect_yolo_fields(img_bgr):
         if crop.size == 0:
             continue
 
-        # Multi-OCR fusion
-        text = multi_ocr_fusion(crop)
+        enhanced = enhance_crop(crop)
+        text = run_ocr(enhanced)
 
         # Validate
         if field == "name":
@@ -410,11 +323,13 @@ def detect_yolo_fields(img_bgr):
         if text and (field not in fields or conf > fields[field].get("conf", 0)):
             fields[field] = {"text": text, "conf": round(conf, 3)}
 
+    print(f"Detected {len(boxes)} boxes")
+    print(f"{field} OCR RAW: {text}")
     return fields
 
 
 # =========================
-# Camera + Display (same as before)
+# Camera & Display
 # =========================
 def capture(instruction):
     cap = cv2.VideoCapture(0)
@@ -485,36 +400,36 @@ def show_result(title, data, verdict=None):
 # Scan Logic
 # =========================
 def scan_front():
-    best_results = {"name": None, "dl_no": None, "issue_date": None}
+    best = {"name": None, "dl_no": None, "issue_date": None}
 
     for attempt in range(1, MAX_RETRIES + 1):
-        missing = [f for f, v in best_results.items() if not v]
+        missing = [f for f, v in best.items() if not v]
         instr = "Show FRONT of Driving License" if attempt == 1 else f"FRONT retry {attempt}/{MAX_RETRIES} — missing: {', '.join(missing)}"
 
         frame = capture(instr)
-        yolo_fields = detect_yolo_fields(frame)
+        yolo_fields = detect_fields(frame)
 
         for field in ["name", "dl_no"]:
             if field in yolo_fields and yolo_fields[field]["text"]:
                 new_text = yolo_fields[field]["text"]
                 new_conf = yolo_fields[field]["conf"]
 
-                if not best_results[field] or new_conf > 0.85:
-                    best_results[field] = new_text
+                if not best[field] or new_conf > 0.85:
+                    best[field] = new_text
                     print(f"  ✔ {field:12s}: '{new_text}' (conf={new_conf:.2f})")
 
-        full_texts = extract_full_image_text(frame)
+        full_texts = extract_all_text(frame)
         issue_date = find_issue_date(full_texts)
 
-        if issue_date and not best_results["issue_date"]:
-            best_results["issue_date"] = issue_date
+        if issue_date and not best["issue_date"]:
+            best["issue_date"] = issue_date
             print(f"  ✔ issue_date  : '{issue_date}'")
 
-        if all(best_results.values()):
+        if all(best.values()):
             print(f"\n  ✅ All FRONT fields found!")
             break
 
-    return best_results
+    return best
 
 
 def scan_back():
@@ -524,7 +439,7 @@ def scan_back():
         instr = "Show BACK of Driving License" if attempt == 1 else f"BACK retry {attempt}/{MAX_RETRIES}"
 
         frame = capture(instr)
-        full_texts = extract_full_image_text(frame)
+        full_texts = extract_all_text(frame)
         expiry_date = find_expiry_date(full_texts)
 
         if expiry_date and not best_expiry:
@@ -540,7 +455,7 @@ def scan_back():
 # =========================
 def main():
     print("=" * 55)
-    print("   MULTI-STATE DL SCANNER (Enhanced Accuracy)")
+    print("   MULTI-STATE DL SCANNER (Enhanced)")
     print("=" * 55)
 
     load_yolo()
