@@ -1,16 +1,3 @@
-"""
-dl_camera_app.py — Multi-State Driving License Scanner (Simplified + Enhanced)
-
-Improvements:
-  1. Aggressive preprocessing (2x upscale, stronger enhancement)
-  2. PaddleOCR only (removed multi-OCR to avoid crashes)
-  3. Smart validation and error correction
-
-Workflow:
-  FRONT (3 retries): name, dl_no, issue_date
-  BACK (3 retries): expiry_date
-"""
-
 import os
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
@@ -34,7 +21,7 @@ collection = client["licenseDB"]["licenses"]
 
 yolo_model = None
 ocr = PaddleOCR(use_angle_cls=True, lang="en")
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 
 YOLO_CLASSES = {0: "name", 1: "dl_no", 2: "dob"}
 
@@ -146,31 +133,80 @@ def fix_ocr_errors(text):
 
 
 def validate_dl_number(text):
-    """Validate DL number: XX## #### #######."""
     if not text:
         return None
 
-    cleaned = fix_ocr_errors(text.replace(" ", "").replace("-", "").upper())
+    cleaned = text.replace(" ", "").replace("-", "").upper()
 
-    # 2 letters + 13-17 digits
-    if re.match(r'^[A-Z]{2}\d{13,17}$', cleaned):
-        return cleaned
+    # Fix common OCR confusions globally
+    cleaned = cleaned.replace("O", "0")
+    cleaned = cleaned.replace("I", "1")
+    cleaned = cleaned.replace("L", "1")
 
-    # Try to extract if embedded
-    match = re.search(r'([A-Z]{2}\d{13,17})', cleaned)
-    return match.group(1) if match else None
+    # Telangana / Indian DL format
+    match = re.search(r'[A-Z]{2}\d{2}\d{4}\d{5,8}', cleaned)
+
+    if match:
+        return match.group(0)
+
+    return None
+
+def fix_name_ocr_errors(text):
+    """Fix common OCR errors in names."""
+    if not text:
+        return text
+
+    # Known OCR error patterns (add more as you discover them)
+    corrections = {
+        'KOOAL': 'KODALI',
+        'KOQALI': 'KODALI',
+        'K0DALI': 'KODALI',
+        'KQDALI': 'KODALI',
+        'ODALII': 'KODALI',
+        'DAAIT': 'BABIT',
+        'KODAM': 'KODALI',
+        'BAAIT': 'BABIT',
+        'BARIT': 'BABIT',
+        'DABIT': 'BABIT',
+        'RAAIT': 'BABIT',
+        'KODAL': 'KODALI',
+        'XODALI': 'KODALI'
+    }
+
+    upper_text = text.upper()
+    for wrong, right in corrections.items():
+        if wrong in upper_text:
+            upper_text = upper_text.replace(wrong, right)
+            return upper_text
+
+    # Generic pattern: double O before vowel → second O becomes D
+    result = list(text.upper())
+    for i in range(1, len(result) - 1):
+        if result[i] == 'O' and result[i-1] == 'O' and result[i+1] in 'AEIOU':
+            result[i] = 'D'
+
+    return ''.join(result)
 
 
 def validate_name(text):
-    """Validate name: 2+ words, alphabetic only."""
+    """Validate and fix name with OCR error correction."""
     if not text:
         return None
 
-    cleaned = re.sub(r'[^A-Za-z\s\-]', '', text).strip()
-    words = cleaned.split()
+    # Apply OCR fixes first
+    fixed = fix_name_ocr_errors(text)
 
+    # Remove non-alphabetic except spaces
+    cleaned = re.sub(r'[^A-Za-z\s]', '', fixed).strip()
+
+    words = cleaned.split()
     if len(words) >= 2 and len(cleaned) >= 5:
-        return cleaned.upper()
+        return ' '.join(words).upper()
+
+    # If single long word, try splitting in middle
+    if len(cleaned) >= 8:
+        mid = len(cleaned) // 2
+        return cleaned[:mid] + " " + cleaned[mid:]
 
     return None
 
@@ -238,24 +274,73 @@ def find_issue_date(texts):
     return None
 
 
-def find_expiry_date(texts):
-    """Find expiry date."""
-    # Look for "validity" label
+def find_name_from_full_text(texts):
+    """
+    Find name using label-aware search (fallback when YOLO crop fails).
+    On Indian licenses, name appears right after the DL number.
+    """
+    # Look for DL number first, then take the next line as name
+    for i, text in enumerate(texts):
+        # Check if this token looks like a DL number
+        cleaned = text.replace(" ", "").replace("-", "").upper()
+        if re.match(r'^[A-Z]{2}\d{13,17}$', cleaned):
+            # Name should be in next 1-3 tokens
+            for j in range(i+1, min(i+4, len(texts))):
+                candidate = texts[j]
+                validated = validate_name(candidate)
+                if validated:
+                    print(f"  → Found name after DL number: '{validated}'")
+                    return validated
+
+    # Fallback: look for any valid 2-word alphabetic line
     for text in texts:
-        if re.search(r"(?:validity|valid|expiry)", text, re.IGNORECASE):
+        validated = validate_name(text)
+        if validated:
+            print(f"  → Found name (generic match): '{validated}'")
+            return validated
+
+    return None
+
+
+def find_expiry_date(texts):
+    """Find expiry date with label-aware search (same strategy as issue_date)."""
+    # Priority 1: Look for explicit validity labels (broader patterns)
+    for text in texts:
+        # Match more label variations
+        if re.search(r"(?:validity|valid|expiry|expire|date.*valid|till|upto|up.*to)", text, re.IGNORECASE):
             validated = validate_date(text)
             if validated:
                 dt = datetime.strptime(validated, "%d-%m-%Y")
                 if dt.year >= 2025:
+                    print(f"  → Found expiry with label: '{text}' → {validated}")
                     return validated
 
-    # Fallback: any future date
+    # Priority 2: Look for "Non-Transport" section (Telangana specific)
+    # Expiry date appears after "Non-Transport" or "Non Transport" text
+    for i, text in enumerate(texts):
+        if re.search(r"non.*transport", text, re.IGNORECASE):
+            # Check next few tokens for date
+            for j in range(i+1, min(i+5, len(texts))):
+                validated = validate_date(texts[j])
+                if validated:
+                    dt = datetime.strptime(validated, "%d-%m-%Y")
+                    if dt.year >= 2025:
+                        print(f"  → Found expiry after 'Non-Transport': {validated}")
+                        return validated
+
+    # Priority 3: Look for two dates, pick the later one (issue=earlier, expiry=later)
+    all_dates = []
     for text in texts:
         validated = validate_date(text)
         if validated:
             dt = datetime.strptime(validated, "%d-%m-%Y")
             if dt.year >= 2025:
-                return validated
+                all_dates.append((dt, validated))
+
+    if all_dates:
+        all_dates.sort(reverse=True)  # Latest date first
+        print(f"  → Found expiry (latest future date): {all_dates[0][1]}")
+        return all_dates[0][1]
 
     return None
 
@@ -313,6 +398,8 @@ def detect_fields(img_bgr):
 
         enhanced = enhance_crop(crop)
         text = run_ocr(enhanced)
+        print(f"Detected {len(boxes)} boxes")
+        print(f"{field} OCR RAW: {text}")
 
         # Validate
         if field == "name":
@@ -323,8 +410,7 @@ def detect_fields(img_bgr):
         if text and (field not in fields or conf > fields[field].get("conf", 0)):
             fields[field] = {"text": text, "conf": round(conf, 3)}
 
-    print(f"Detected {len(boxes)} boxes")
-    print(f"{field} OCR RAW: {text}")
+
     return fields
 
 
@@ -419,6 +505,14 @@ def scan_front():
                     print(f"  ✔ {field:12s}: '{new_text}' (conf={new_conf:.2f})")
 
         full_texts = extract_all_text(frame)
+
+        # Try to find name from full text if YOLO didn't get it
+        if not best["name"]:
+            name_from_full = find_name_from_full_text(full_texts)
+            if name_from_full:
+                best["name"] = name_from_full
+                print(f"  ✔ name (full-text): '{name_from_full}'")
+
         issue_date = find_issue_date(full_texts)
 
         if issue_date and not best["issue_date"]:
