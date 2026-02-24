@@ -1,9 +1,3 @@
-"""
-dl_camera_app.py — Multi-State Driving License Scanner (GPU-Optimized)
-
-Final version using PaddleOCR with all accuracy improvements.
-"""
-
 import os
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
@@ -34,8 +28,14 @@ YOLO_CLASSES = {0: "name", 1: "dl_no", 2: "dob"}
 # =========================
 # Enhanced Preprocessing
 # =========================
+"""
+COPY THIS FUNCTION to replace enhance_crop in dl_camera_app.py (lines 37-59)
+This version extracts the RED channel to make red text visible
+"""
+
+
 def enhance_crop(crop):
-    """Aggressive enhancement for small text."""
+    """Enhanced preprocessing - extracts RED channel for red text."""
     h, w = crop.shape[:2]
 
     # 2x upscaling minimum
@@ -46,18 +46,21 @@ def enhance_crop(crop):
     # Strong denoising
     crop = cv2.fastNlMeansDenoisingColored(crop, None, 15, 15, 7, 21)
 
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # Extract RED channel (red text shows as darker on red background)
+    b, g, r = cv2.split(crop)
 
-    # Aggressive CLAHE
+    # Try red channel first
+    red_inv = cv2.bitwise_not(r)  # Invert so dark text becomes bright
+
+    # Apply CLAHE
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
-    eq = clahe.apply(gray)
+    red_enhanced = clahe.apply(red_inv)
 
     # Strong unsharp masking
-    blur = cv2.GaussianBlur(eq, (0, 0), 2.5)
-    sharp = cv2.addWeighted(eq, 2.0, blur, -1.0, 0)
+    blur = cv2.GaussianBlur(red_enhanced, (0, 0), 2.5)
+    sharp = cv2.addWeighted(red_enhanced, 2.0, blur, -1.0, 0)
 
     return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
-
 
 def enhance_full_image(frame):
     """Enhanced full-image preprocessing."""
@@ -159,12 +162,19 @@ def fix_name_ocr_errors(text):
         'DABIT': 'BABIT',
         'RAAIT': 'BABIT',
         'KODAL': 'KODALI',
-        'XODALI': 'KODALI'
+        'XODALI': 'KODALI',
+        'KODAO': 'KODALI',
+        'BARIT': 'BABIT',
+        'RODAL': 'KODALI',
+        'KODALII': 'KODALI',
+        'KODARI': 'KODALI',
+        'KODALI LE': 'KODALI',
+        'KODALI TEL': 'KODALI'
     }
 
     upper_text = text.upper()
     for wrong, right in corrections.items():
-        if wrong in upper_text:
+        if re.search(r'\b' + re.escape(wrong) + r'\b', upper_text):
             upper_text = upper_text.replace(wrong, right)
             return upper_text
 
@@ -174,7 +184,11 @@ def fix_name_ocr_errors(text):
         if result[i] == 'O' and result[i-1] == 'O' and result[i+1] in 'AEIOU':
             result[i] = 'D'
 
-    return ''.join(result)
+    result_str = ''.join(result)
+    if result_str.endswith('II'):
+        result_str = result_str[:-2] + 'I'  # Remove one I
+
+    return result_str
 
 
 def validate_dl_number(text):
@@ -255,28 +269,61 @@ def validate_date(text):
 # Date Finding (Label-Aware)
 # =========================
 def find_name_from_full_text(texts):
-    """Find name using label-aware search."""
-    # Look for DL number, then take next line as name
+    """Find name using position-based search (right below DL number)."""
+    # Look for DL number, then take FIRST valid name line below it
     for i, text in enumerate(texts):
         cleaned = text.replace(" ", "").replace("-", "").upper()
         if re.match(r'^[A-Z]{2}\d{13,17}$', cleaned):
-            for j in range(i+1, min(i+4, len(texts))):
+            # Check only the next 2 lines (not 4)
+            for j in range(i + 1, min(i + 3, len(texts))):
                 candidate = texts[j]
+
+                # Skip lines that are clearly not names
+                if any(x in candidate.upper() for x in ['S/D/W', 'S/O', 'D/O', 'W/O', 'PLOT', 'ADD', 'ADDRESS']):
+                    continue
+
                 validated = validate_name(candidate)
                 if validated:
-                    print(f"  → Found name after DL: '{validated}'")
-                    return validated
+                    # IMPORTANT: Only take names with 2 words (first + last name)
+                    # Skip if it has 3+ words (might be father's name or address)
+                    words = validated.split()
+                    if len(words) == 2:
+                        print(f"  → Found name after DL: '{validated}'")
+                        return validated
+                    elif len(words) > 2:
+                        # Try taking just first 2 words
+                        first_two = ' '.join(words[:2])
+                        print(f"  → Found name after DL (first 2 words): '{first_two}'")
+                        return first_two
 
-    # Fallback: any valid 2-word line
+    # Fallback: Look for line starting with "Name" or "S/W" label
+    for i, text in enumerate(texts):
+        if re.search(r'\bname\b', text, re.IGNORECASE):
+            # Next line after "Name:" label
+            if i + 1 < len(texts):
+                validated = validate_name(texts[i + 1])
+                if validated:
+                    words = validated.split()
+                    if len(words) >= 2:
+                        result = ' '.join(words[:2])
+                        print(f"  → Found name after label: '{result}'")
+                        return result
+
+    # Last resort: any valid 2-word line (but prefer shorter ones = main name)
+    names = []
     for text in texts:
         validated = validate_name(text)
         if validated:
-            print(f"  → Found name: '{validated}'")
-            return validated
+            words = validated.split()
+            if len(words) == 2:
+                names.append(validated)
+
+    if names:
+        # Take the first one found (usually the main name)
+        print(f"  → Found name (first 2-word): '{names[0]}'")
+        return names[0]
 
     return None
-
-
 def find_issue_date(texts):
     """Find issue date with label matching."""
     today = datetime.today()
@@ -299,8 +346,6 @@ def find_issue_date(texts):
                 return validated
 
     return None
-
-
 def find_expiry_date(texts):
     """Find expiry date with label-aware search."""
     # Priority 1: explicit validity labels
@@ -341,6 +386,28 @@ def find_expiry_date(texts):
     return None
 
 
+def find_dl_from_full_text(texts):
+    """Search for DL number in full text as fallback."""
+    for text in texts:
+        cleaned = text.replace(" ", "").replace("-", "").upper()
+        # Try to find pattern
+        match = re.search(r'([A-Z]{2}\d{13,17})', cleaned)
+        if match:
+            dl_num = match.group(1)
+            print(f"  → Found DL in full text: '{dl_num}'")
+            return dl_num
+
+    # Try combining all text
+    combined = "".join(texts).replace(" ", "").replace("-", "").upper()
+    match = re.search(r'([A-Z]{2}\d{13,17})', combined)
+    if match:
+        dl_num = match.group(1)
+        print(f"  → Found DL in combined text: '{dl_num}'")
+        return dl_num
+
+    return None
+
+
 def check_expiry(expiry_str):
     dt = datetime.strptime(expiry_str, "%d-%m-%Y")
     today = datetime.today()
@@ -372,7 +439,7 @@ def load_models():
 
 
 def detect_fields(img_bgr):
-    """YOLO + OCR + validation."""
+    """YOLO + OCR + validation with fallback."""
     h, w = img_bgr.shape[:2]
     if w < 1000:
         scale = 1000 / w
@@ -383,6 +450,8 @@ def detect_fields(img_bgr):
     results = yolo_model.predict(img_bgr, conf=0.25, device=device, verbose=False)
     boxes = results[0].boxes
 
+    print(f"Detected {len(boxes)} boxes")
+
     fields = {}
     for box in boxes:
         cls_id = int(box.cls[0])
@@ -392,8 +461,10 @@ def detect_fields(img_bgr):
 
         conf = float(box.conf[0])
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        x1 = max(0, x1-8); y1 = max(0, y1-8)
-        x2 = min(w, x2+8); y2 = min(h, y2+8)
+        x1 = max(0, x1 - 8);
+        y1 = max(0, y1 - 8)
+        x2 = min(w, x2 + 8);
+        y2 = min(h, y2 + 8)
 
         crop = img_bgr[y1:y2, x1:x2]
         if crop.size == 0:
@@ -402,11 +473,21 @@ def detect_fields(img_bgr):
         enhanced = enhance_crop(crop)
         text = run_ocr(enhanced)
 
+        # DEBUG: Show raw OCR output
+        print(f"{field} OCR RAW: '{text}'")
+
+        # Save original text before validation
+        original_text = text
+
         # Validate
         if field == "name":
             text = validate_name(text)
         elif field == "dl_no":
             text = validate_dl_number(text)
+
+        # DEBUG: Show validated output
+        if original_text != text:
+            print(f"{field} VALIDATED: '{original_text}' → '{text}'")
 
         if text and (field not in fields or conf > fields[field].get("conf", 0)):
             fields[field] = {"text": text, "conf": round(conf, 3)}
@@ -418,7 +499,14 @@ def detect_fields(img_bgr):
 # Camera & Display
 # =========================
 def capture(instruction):
-    cap = cv2.VideoCapture(0)
+    # Use DroidCam HTTP stream
+    droidcam_ip = "http://192.168.0.105:4747/video"  # Change IP to match your phone
+    cap = cv2.VideoCapture(droidcam_ip)
+
+    # Fallback to laptop camera if DroidCam fails
+    if not cap.isOpened():
+        print("DroidCam not available, using laptop camera...")
+        cap = cv2.VideoCapture(0)
     print(f"\n  {instruction}")
     print("  SPACE = capture   Q = quit\n")
 
@@ -500,18 +588,17 @@ def scan_front():
                 new_text = yolo_fields[field]["text"]
                 new_conf = yolo_fields[field]["conf"]
 
-                if not best[field] or new_conf > 0.85:
+                if not best[field] or new_conf > best[field].get("conf", 0):
                     best[field] = new_text
                     print(f"  ✔ {field:12s}: '{new_text}' (conf={new_conf:.2f})")
 
         full_texts = extract_all_text(frame)
 
-        # Fallback name extraction
-        if not best["name"]:
-            name_from_full = find_name_from_full_text(full_texts)
-            if name_from_full:
-                best["name"] = name_from_full
-                print(f"  ✔ name (full): '{name_from_full}'")
+        if not best["dl_no"]:
+            dl_from_full = find_dl_from_full_text(full_texts)
+            if dl_from_full:
+                best["dl_no"] = dl_from_full
+                print(f"  ✔ dl_no (full): '{dl_from_full}'")
 
         issue_date = find_issue_date(full_texts)
 
