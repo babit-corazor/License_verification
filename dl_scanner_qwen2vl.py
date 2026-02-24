@@ -282,7 +282,7 @@ def main():
 
     # Connect to MongoDB (moved here so network issues don't block startup)
     MONGO_URI = os.environ.get("MONGO_URI",
-                               "mongodb+srv://corazortechnology:A0Qfk2PbjOMKN32Z@cluster0.drxzj5r.mongodb.net/")
+                               "")
 
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
